@@ -139,6 +139,7 @@ export interface AudioFolder {
   descripcion: string;
   coverKey: string;
   coverUrl?: string;
+  portada?: string;
   badge?: string;
   canciones: Song[];
 }
@@ -441,24 +442,31 @@ export default function App() {
           const row = docSnap.data() as any;
           const sTitle = String(row.title || row.titulo || '').trim();
           const sArtist = String(row.artist || row.artista || row.performer || '').trim();
+          const sFileName = String(row.file_name || '').trim();
 
           if (sTitle.startsWith('__spotyy_')) return;
 
-          // Filtrar por término de búsqueda en título o artista
-          if (sTitle.toLowerCase().includes(q) || sArtist.toLowerCase().includes(q)) {
-            const telegramFileId = row.telegram_file_id || row.file_id || '';
+          // Filtrar por término de búsqueda en título, artista o nombre de archivo
+          if (sTitle.toLowerCase().includes(q) || sArtist.toLowerCase().includes(q) || sFileName.toLowerCase().includes(q)) {
+            let telegramFileId = (row.telegram_file_id || row.file_id || '').trim();
+            if (!telegramFileId && row.storage_path && String(row.storage_path).startsWith('telegram://')) {
+              telegramFileId = String(row.storage_path).replace('telegram://', '').trim();
+            }
+
             const audioUrl = telegramFileId
               ? `/api/stream/${encodeURIComponent(telegramFileId)}`
               : (row.audio_url || row.url || row.playback_url || row.storage_path || '');
 
             const coverUrl = row.cover_url || row.cover || '';
+            const resolvedTitle = sTitle || sFileName.replace(/\.[^/.]+$/, '') || 'Canción';
+            const resolvedArtist = sArtist || 'Artista';
 
             matches.push({
               id: docSnap.id,
-              title: sTitle || 'Canción',
-              titulo: sTitle || 'Canción',
-              artist: sArtist || 'Artista',
-              artista: sArtist || 'Artista',
+              title: resolvedTitle,
+              titulo: resolvedTitle,
+              artist: resolvedArtist,
+              artista: resolvedArtist,
               telegram_file_id: telegramFileId || undefined,
               file_id: telegramFileId || undefined,
               audio_url: audioUrl,
@@ -481,52 +489,6 @@ export default function App() {
         setIsSearchingFirestore(false);
       }
     }, 250);
-
-    return () => clearTimeout(timer);
-  }, [searchQuery]);
-
-  // Estado adicional para resultados de audios en Telegram
-  const [telegramAudioResults, setTelegramAudioResults] = useState<Array<{
-    id: string;
-    title: string;
-    performer: string;
-    duration: number;
-    file_name: string;
-    file_unique_id: string;
-  }>>([]);
-  const [isSearchingTelegram, setIsSearchingTelegram] = useState<boolean>(false);
-  const [telegramSearchError, setTelegramSearchError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const q = searchQuery.trim();
-    if (!q || q.length < 2) {
-      setTelegramAudioResults([]);
-      setIsSearchingTelegram(false);
-      setTelegramSearchError(null);
-      return;
-    }
-
-    setIsSearchingTelegram(true);
-    setTelegramSearchError(null);
-
-    const timer = setTimeout(async () => {
-      try {
-        const res = await fetch(`/api/audio/search?q=${encodeURIComponent(q)}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (data && data.success && Array.isArray(data.results)) {
-          setTelegramAudioResults(data.results);
-        } else {
-          setTelegramAudioResults([]);
-        }
-      } catch (err: any) {
-        console.warn('[Telegram Audio Search Error]:', err);
-        setTelegramSearchError('Error al consultar audios de Telegram');
-        setTelegramAudioResults([]);
-      } finally {
-        setIsSearchingTelegram(false);
-      }
-    }, 350);
 
     return () => clearTimeout(timer);
   }, [searchQuery]);
@@ -3095,173 +3057,92 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     cancelOrganizeRef.current = false;
     setIsOrganizingRunning(true);
     setOrganizeStep('processing');
-    triggerToast('Organizando biblioteca: Portadas, limpieza de vacías y nuevas carpetas...', 'info');
+    triggerToast('Organizando biblioteca en Firebase...', 'info');
 
     try {
-      // 1. Obtener todas las canciones existentes de la colección 'songs' en Firestore
-      const songsSnap = await getDocs(collection(db, 'songs'));
-      const dbSongs: Song[] = [];
-      songsSnap.forEach((d) => {
-        const data = d.data() as any;
-        if (!String(data.title || data.titulo || '').startsWith('__spotyy_')) {
-          dbSongs.push({ id: d.id, ...data });
+      // 1. Obtener carpetas y canciones actuales del estado
+      const listaCarpetas = [...(foldersRef.current && foldersRef.current.length > 0 ? foldersRef.current : folders)];
+      const listaCanciones = [...(songs.length > 0 ? songs : (canciones.length > 0 ? canciones : library))];
+
+      // Mapeo auxiliar de canciones por carpeta por si las canciones no están asociadas dentro del array carpeta.canciones
+      const cancionesPorCarpeta = new Map<string, Song[]>();
+      for (const cancion of listaCanciones) {
+        const fid = cancion.folder_id || 'mis_canciones';
+        if (!cancionesPorCarpeta.has(fid)) {
+          cancionesPorCarpeta.set(fid, []);
         }
-      });
-
-      // 2. Obtener todas las carpetas existentes de la colección 'folders' en Firestore
-      const foldersSnap = await getDocs(collection(db, 'folders'));
-      const foldersMap = new Map<string, AudioFolder>();
-
-      foldersSnap.forEach((d) => {
-        const data = d.data() as any;
-        foldersMap.set(d.id, {
-          id: d.id,
-          titulo: data.titulo || data.title || d.id,
-          subtitulo: data.subtitulo || '',
-          descripcion: data.descripcion || '',
-          coverKey: data.cover_key || data.coverKey || '',
-          coverUrl: data.cover_url || data.coverUrl || '',
-          badge: data.badge || '',
-          canciones: []
-        });
-      });
-
-      // Si Firestore aún no tenía registros de carpetas, incorporar las carpetas actuales en memoria
-      const currentKnownFolders = foldersRef.current && foldersRef.current.length > 0 ? foldersRef.current : folders;
-      for (const kf of currentKnownFolders) {
-        if (!foldersMap.has(kf.id)) {
-          foldersMap.set(kf.id, { ...kf, canciones: [] });
-        }
+        cancionesPorCarpeta.get(fid)!.push(cancion);
       }
 
-      // =========================================================================
-      // 3. CREAR NUEVAS CARPETAS:
-      // Si hay canciones nuevas que no tienen carpeta asignada, crear automáticamente
-      // una carpeta con el nombre de su género o artista, asignarle la canción y
-      // ponerle su foto de portada Unsplash guardada en Firestore.
-      // =========================================================================
-      for (const song of dbSongs) {
-        const rawFolderId = (song.folder_id || '').trim();
-        // Si no tiene carpeta asignada
-        if (!rawFolderId || rawFolderId === 'sin_carpeta') {
-          const rawName = (song.genre || song.artist || song.artista || 'Mis Canciones').trim();
-          const folderTitle = rawName.charAt(0).toUpperCase() + rawName.slice(1);
-          const newFolderSlug = folderTitle
-            .toLowerCase()
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/[^a-z0-9]+/g, '_')
-            .replace(/^_+|_+$/g, '') || `carpeta_${Date.now()}`;
+      const carpetasActualizadas: AudioFolder[] = [];
 
-          // Portada automática requerida de Unsplash
-          const unsplashCover = `https://source.unsplash.com/400x400/?${encodeURIComponent(folderTitle)},music`;
+      // Recorrer las carpetas
+      for (const carpeta of listaCarpetas) {
+        // En nuestro código, la propiedad que cuenta los audios es 'canciones' (carpeta.canciones)
+        const cancionesDeCarpeta = carpeta.canciones && carpeta.canciones.length > 0
+          ? carpeta.canciones
+          : (cancionesPorCarpeta.get(carpeta.id) || []);
 
-          // Si la carpeta no existía, crearla en Firestore
-          if (!foldersMap.has(newFolderSlug)) {
-            const nuevaCarpetaData = {
-              id: newFolderSlug,
-              titulo: folderTitle,
-              subtitulo: `Colección de ${folderTitle}`,
-              descripcion: `Carpeta creada automáticamente para canciones de ${folderTitle}`,
-              cover_key: unsplashCover,
-              cover_url: unsplashCover,
-              badge: folderTitle,
-              updated_at: new Date().toISOString()
-            };
+        const cantidadCanciones = cancionesDeCarpeta.length;
 
-            await setDoc(doc(db, 'folders', newFolderSlug), nuevaCarpetaData, { merge: true });
-            foldersMap.set(newFolderSlug, {
-              id: newFolderSlug,
-              titulo: folderTitle,
-              subtitulo: `Colección de ${folderTitle}`,
-              descripcion: `Carpeta creada automáticamente para canciones de ${folderTitle}`,
-              coverKey: unsplashCover,
-              coverUrl: unsplashCover,
-              badge: folderTitle,
-              canciones: []
-            });
+        if (cantidadCanciones === 0) {
+          // Requerimiento 1: Borrar carpetas vacías en Firebase
+          await deleteDoc(doc(db, 'folders', carpeta.id));
+          console.log(`[Organizar Biblioteca] Carpeta vacía eliminada de Firebase: ${carpeta.id}`);
+        } else {
+          // Requerimiento 2: Asignar portada en Firebase usando Unsplash y updateDoc
+          const nombreCarpeta = carpeta.titulo || carpeta.id;
+          const url = `https://source.unsplash.com/400x400/?${encodeURIComponent(nombreCarpeta)},music`;
+
+          try {
+            await updateDoc(doc(db, 'folders', carpeta.id), { portada: url });
+          } catch (updErr: any) {
+            // Si el documento de la carpeta no existía previamente en Firestore, crearlo con merge
+            if (updErr?.code === 'not-found' || updErr?.message?.includes('No document to update')) {
+              await setDoc(doc(db, 'folders', carpeta.id), {
+                id: carpeta.id,
+                titulo: carpeta.titulo,
+                portada: url,
+                cover_url: url,
+                coverUrl: url,
+                cover_key: url,
+                coverKey: url
+              }, { merge: true });
+            } else {
+              throw updErr;
+            }
           }
 
-          // Asignar la canción a la nueva carpeta y actualizarla en Firestore
-          song.folder_id = newFolderSlug;
-          if (song.id && !String(song.id).startsWith('local_')) {
-            await updateDoc(doc(db, 'songs', String(song.id)), { folder_id: newFolderSlug }).catch(() => {});
-          }
+          // Mantener en el estado local con su nueva portada
+          carpetasActualizadas.push({
+            ...carpeta,
+            portada: url,
+            coverUrl: url,
+            coverKey: url,
+            canciones: cancionesDeCarpeta
+          });
         }
       }
 
-      // =========================================================================
-      // 2. LIMPIAR VACÍAS:
-      // Eliminar de Firestore cualquier carpeta que tenga 0 canciones.
-      // =========================================================================
-      // Contar cuántas canciones pertenecen a cada carpeta
-      const cancionesPorCarpeta = new Map<string, number>();
-      for (const song of dbSongs) {
-        if (song.folder_id) {
-          const count = cancionesPorCarpeta.get(song.folder_id) || 0;
-          cancionesPorCarpeta.set(song.folder_id, count + 1);
-        }
-      }
+      // Requerimiento 3: Actualizar la pantalla (Estado local de React)
+      setFolders(carpetasActualizadas);
+      foldersRef.current = carpetasActualizadas;
+      setSongs(listaCanciones);
+      setCanciones(listaCanciones);
 
-      const carpetasParaEliminar: string[] = [];
-      for (const [folderId] of foldersMap.entries()) {
-        const cantCanciones = cancionesPorCarpeta.get(folderId) || 0;
-        if (cantCanciones === 0) {
-          carpetasParaEliminar.push(folderId);
-        }
-      }
-
-      for (const folderId of carpetasParaEliminar) {
-        try {
-          await deleteDoc(doc(db, 'folders', folderId));
-          foldersMap.delete(folderId);
-          console.log(`[Organizar Biblioteca] Carpeta vacía eliminada de Firestore: ${folderId}`);
-        } catch (errDel) {
-          console.warn(`Error eliminando carpeta vacía ${folderId}:`, errDel);
-        }
-      }
-
-      // =========================================================================
-      // 1. PONER PORTADAS:
-      // Asignar una imagen automática a cada carpeta usando la API de Unsplash
-      // (https://source.unsplash.com/400x400/?{nombre_carpeta},music) y guardarla en Firestore.
-      // =========================================================================
-      for (const [folderId, folderItem] of foldersMap.entries()) {
-        const nombreCarpeta = folderItem.titulo || folderId;
-        const unsplashCover = `https://source.unsplash.com/400x400/?${encodeURIComponent(nombreCarpeta)},music`;
-
-        folderItem.coverKey = unsplashCover;
-        folderItem.coverUrl = unsplashCover;
-
-        try {
-          await setDoc(
-            doc(db, 'folders', folderId),
-            {
-              id: folderId,
-              titulo: nombreCarpeta,
-              cover_key: unsplashCover,
-              cover_url: unsplashCover,
-              updated_at: new Date().toISOString()
-            },
-            { merge: true }
-          );
-        } catch (errCover) {
-          console.warn(`Error guardando portada de carpeta ${folderId} en Firestore:`, errCover);
-        }
-      }
-
-      // 4. Sincronizar estado reactivo de carpetas y canciones
-      await cargarCarpetasDesdeSupabase();
-      await cargarCanciones();
+      try {
+        localStorage.setItem('fa_folders_v3', JSON.stringify(carpetasActualizadas));
+      } catch {}
 
       setIsOrganizingRunning(false);
       setOrganizeStep('completed');
       setShowOrganizeModal(false);
-      triggerToast('¡Biblioteca organizada con éxito! Portadas asignadas, carpetas vacías eliminadas y nuevas creadas.', 'success');
+      triggerToast('¡Biblioteca organizada correctamente en Firebase!', 'success');
     } catch (error: any) {
-      console.error('Error durante la organización de la biblioteca:', error);
+      // Requerimiento 4: Manejo de errores - alert con el error exacto de Firebase
+      console.error('Error al organizar biblioteca en Firebase:', error);
       setIsOrganizingRunning(false);
-      triggerToast('Error organizando biblioteca: ' + (error?.message || 'Error desconocido'), 'error');
+      alert(`Error en Firebase: ${error?.message || error}`);
     }
   };
 
@@ -5218,13 +5099,18 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     return currentList;
   }, [selectedFolder, currentSong, songs, canciones]);
 
-  // Helper para resolver la URL de audio en cumplimiento con Requerimiento 3:
-  // - Revisa si la canción tiene telegram_file_id o una URL de Cloudflare R2 / directa.
-  // - Si tiene telegram_file_id, el src apunta al backend: /api/stream/{telegram_file_id}.
+  // Helper para resolver la URL de audio en cumplimiento con Requerimientos:
+  // 1. Revisa si la canción tiene telegram_file_id guardado.
+  // 2. Si tiene telegram_file_id, el src del reproductor apunta a /api/stream/{telegram_file_id}.
+  // 3. Si no tiene telegram_file_id pero tiene una URL de Cloudflare R2 o directa, reproduce normalmente desde R2.
   const obtenerSrcReproductor = useCallback((song: Song | null): string => {
     if (!song) return '';
 
-    const telegramFileId = song.telegram_file_id || song.file_id;
+    let telegramFileId = (song.telegram_file_id || song.file_id || '').trim();
+    if (!telegramFileId && song.storage_path && String(song.storage_path).startsWith('telegram://')) {
+      telegramFileId = String(song.storage_path).replace('telegram://', '').trim();
+    }
+
     if (telegramFileId) {
       return `/api/stream/${encodeURIComponent(telegramFileId)}`;
     }
@@ -5286,33 +5172,6 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
     }
     reproducirCancionDirecta(song, contextPlaylist);
   };
-
-  // Reproduce un audio MP3 indexado de Telegram usando el endpoint de streaming backend con soporte HTTP Range
-  const reproducirAudioTelegram = useCallback((item: {
-    id: string;
-    title: string;
-    performer: string;
-    duration: number;
-    file_name: string;
-    file_unique_id: string;
-  }) => {
-    const streamUrl = `/api/audio/${item.id}/stream`;
-    const tgSong: Song = {
-      id: `tg_${item.id}`,
-      titulo: item.title || item.file_name,
-      title: item.title || item.file_name,
-      artista: item.performer || 'Audio Telegram',
-      artist: item.performer || 'Audio Telegram',
-      url: streamUrl,
-      playback_url: streamUrl,
-      audio_url: streamUrl,
-      storage_path: item.id,
-      duration: item.duration || 0,
-      cover: DEFAULT_SONG_COVER,
-      cover_url: DEFAULT_SONG_COVER
-    };
-    seleccionarCancion(tgSong, [tgSong]);
-  }, [seleccionarCancion]);
 
   const togglePlay = () => {
     if (!audioRef.current) return;
@@ -5939,8 +5798,8 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
   };
 
   const renderFolderMosaicOrCover = (folderItem: AudioFolder, cancionesLista: Song[], sizeClasses: string = 'w-52 h-52 sm:w-60 sm:h-60') => {
-    // Si la carpeta tiene una portada personalizada asignada (subida a R2 o URL)
-    const customCover = folderItem.coverUrl || (folderItem.coverKey && (folderItem.coverKey.startsWith('http://') || folderItem.coverKey.startsWith('https://') || folderItem.coverKey.startsWith('data:') || folderItem.coverKey.startsWith('/')) ? folderItem.coverKey : null);
+    // Si la carpeta tiene una portada personalizada asignada (subida a R2, Unsplash o URL)
+    const customCover = folderItem.portada || folderItem.coverUrl || (folderItem.coverKey && (folderItem.coverKey.startsWith('http://') || folderItem.coverKey.startsWith('https://') || folderItem.coverKey.startsWith('data:') || folderItem.coverKey.startsWith('/')) ? folderItem.coverKey : null);
     if (customCover) {
       return (
         <div className={`${sizeClasses} rounded-xl overflow-hidden shadow-2xl shrink-0 bg-neutral-900 border border-white/10 ring-1 ring-black/40 flex items-center justify-center relative group`}>
@@ -6999,7 +6858,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
                               <div className="absolute top-1 left-1 z-10 opacity-0 group-hover:opacity-75 transition p-0.5 rounded bg-black/60 text-gray-300">
                                 <GripVertical className="w-3 h-3" />
                               </div>
-                              {renderCover(folder.coverUrl || folder.coverKey, 'w-16 h-16 shrink-0', folder.titulo)}
+                              {renderCover(folder.portada || folder.coverUrl || folder.coverKey, 'w-16 h-16 shrink-0', folder.titulo)}
                               <div className="flex-1 px-2.5 sm:px-3 min-w-0 py-1">
                                 <span className="text-sm font-black text-white line-clamp-2 leading-tight">
                                   {folder.titulo}
@@ -7611,7 +7470,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
                         title={`Arrastra para reordenar o pulsa para abrir "${folder.titulo}"`}
                       >
                         <div className="w-16 h-16 rounded-lg overflow-hidden shrink-0 shadow bg-neutral-900 mr-3">
-                          {renderCover(folder.coverUrl || folder.coverKey, 'w-full h-full object-cover', folder.titulo)}
+                          {renderCover(folder.portada || folder.coverUrl || folder.coverKey, 'w-full h-full object-cover', folder.titulo)}
                         </div>
                         <div className="flex-1 min-w-0 pr-1">
                           <h4 className="text-sm font-black text-white truncate leading-snug group-hover:text-[#1ED760] transition">
@@ -7828,110 +7687,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
               />
             </div>
 
-            {/* Resultados de búsqueda de Audios en Telegram (Índice Propio) */}
-            {searchQuery.trim().length >= 2 && (
-              <div className="space-y-2 pt-1 pb-1 border-b border-[#2A2A2A]">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-1.5">
-                    <Send className="w-3.5 h-3.5 text-cyan-400" />
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-400">
-                      Audios en Telegram
-                    </h3>
-                  </div>
-                  {telegramAudioResults.length > 0 && (
-                    <span className="text-[10px] text-gray-400 bg-[#222222] px-2 py-0.5 rounded-full font-mono">
-                      {telegramAudioResults.length} {telegramAudioResults.length === 1 ? 'resultado' : 'resultados'}
-                    </span>
-                  )}
-                </div>
 
-                {/* Estado de carga */}
-                {isSearchingTelegram && (
-                  <div className="flex items-center gap-2 p-3 bg-[#1A1A1A] border border-[#2A2A2A] rounded-xl text-xs text-gray-400">
-                    <div className="w-3.5 h-3.5 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
-                    <span>Buscando en audios de Telegram...</span>
-                  </div>
-                )}
-
-                {/* Estado de error */}
-                {!isSearchingTelegram && telegramSearchError && (
-                  <div className="p-2.5 bg-red-950/40 border border-red-800/40 rounded-xl text-xs text-red-300">
-                    {telegramSearchError}
-                  </div>
-                )}
-
-                {/* Estado sin resultados */}
-                {!isSearchingTelegram && !telegramSearchError && telegramAudioResults.length === 0 && (
-                  <div className="p-3 bg-[#181818] border border-[#262626] rounded-xl text-xs text-gray-400 text-center">
-                    No se encontraron audios MP3 en Telegram para "{searchQuery.trim()}".
-                  </div>
-                )}
-
-                {/* Lista de resultados encontrados en Telegram */}
-                {!isSearchingTelegram && telegramAudioResults.length > 0 && (
-                  <div className="space-y-1.5">
-                    {telegramAudioResults.map((tgItem) => {
-                      const isCurrentPlaying = currentSong?.id === `tg_${tgItem.id}` && isPlaying;
-                      const isCurrentSelected = currentSong?.id === `tg_${tgItem.id}`;
-                      const mins = Math.floor((tgItem.duration || 0) / 60);
-                      const secs = Math.floor((tgItem.duration || 0) % 60);
-                      const durStr = tgItem.duration ? `${mins}:${secs < 10 ? '0' : ''}${secs}` : 'MP3';
-
-                      return (
-                        <div
-                          key={tgItem.id}
-                          onClick={() => reproducirAudioTelegram(tgItem)}
-                          className={`flex items-center justify-between p-2.5 rounded-xl cursor-pointer transition border ${
-                            isCurrentSelected
-                              ? 'bg-cyan-950/30 border-cyan-500/50'
-                              : 'bg-[#181818] hover:bg-[#222222] border-[#2A2A2A]'
-                          }`}
-                        >
-                          <div className="flex items-center gap-3 min-w-0">
-                            <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-cyan-600/30 to-blue-700/30 border border-cyan-500/30 flex items-center justify-center shrink-0">
-                              <Music className="w-5 h-5 text-cyan-400" />
-                            </div>
-                            <div className="min-w-0">
-                              <p className={`text-sm font-bold truncate ${isCurrentSelected ? 'text-cyan-400' : 'text-white'}`}>
-                                {tgItem.title || tgItem.file_name}
-                              </p>
-                              <div className="flex items-center gap-2 text-xs text-gray-400">
-                                <span className="truncate max-w-[130px]">{tgItem.performer || 'Audio Telegram'}</span>
-                                <span>•</span>
-                                <span className="font-mono text-[11px] text-gray-500">{durStr}</span>
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center gap-2">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                reproducirAudioTelegram(tgItem);
-                              }}
-                              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 active:scale-95 text-white rounded-lg text-xs font-bold transition shadow-sm"
-                              title="Reproducir audio"
-                            >
-                              {isCurrentPlaying ? (
-                                <>
-                                  <Pause className="w-3.5 h-3.5 fill-current" />
-                                  <span>Pausa</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Play className="w-3.5 h-3.5 fill-current" />
-                                  <span>Reproducir</span>
-                                </>
-                              )}
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
 
             <div className="space-y-2 pt-2">
               <div className="flex items-center justify-between">
@@ -9431,7 +9187,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.app_settings;`;
                   >
                     <div className="flex items-center gap-3 min-w-0">
                       <div className="w-12 h-12 rounded-xl overflow-hidden shrink-0 shadow bg-neutral-900">
-                        {renderCover(folder.coverUrl || folder.coverKey, 'w-full h-full object-cover', folder.titulo)}
+                        {renderCover(folder.portada || folder.coverUrl || folder.coverKey, 'w-full h-full object-cover', folder.titulo)}
                       </div>
                       <div className="min-w-0 pr-2">
                         <p className={`text-sm font-bold truncate ${esCarpetaActual ? 'text-[#1ED760]' : 'text-white'}`}>
